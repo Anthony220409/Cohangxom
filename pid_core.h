@@ -2,8 +2,8 @@
 //  pid_core.h  —  Pure C/C++ Logic, ZERO Hardware Coupling
 //  ESP32-C3 Micro Brushed Drone  |  AUW 45g  |  720+55mm  |  1S
 //
-//  Unified Header: Constants + CascadedPID Class (Declarations)
-//  ⚠️  GLOBAL INSTANCES & COMMAND PARSER in pid_core.cpp (ODR-safe)
+//  ALL-IN-ONE HEADER: Constants + CascadedPID Class + Implementations
+//  Chỉ cần include một lần — tất cả fixes đã apply
 // ================================================================
 #pragma once
 #include <algorithm>
@@ -312,24 +312,176 @@ private:
 
 
 // ================================================================
-//  SECTION 3 — GLOBAL PID INSTANCES & PARSER FUNCTION
+//  SECTION 3 — GLOBAL PID INSTANCES
 // ================================================================
-//  BUG 3 FIX: DECLARE extern here, DEFINE in pid_core.cpp
-//  Mỗi .cpp chỉ link một định nghĩa duy nhất → ODR-safe
 
-extern CascadedPID pidRoll;
-extern CascadedPID pidPitch;
-extern CascadedPID pidYaw;
+static CascadedPID pidRoll (ROLL_ANGLE_P,  ROLL_RATE_P,  ROLL_RATE_I,  ROLL_RATE_D);
+static CascadedPID pidPitch(PITCH_ANGLE_P, PITCH_RATE_P, PITCH_RATE_I, PITCH_RATE_D);
+static CascadedPID pidYaw  (0.0f,          YAW_RATE_P,   YAW_RATE_I,   YAW_RATE_D);
 
-void parseTuneCommand(const String& cmd);
+
+// ================================================================
+//  SECTION 4 — HELPER FUNCTIONS FOR COMMAND PARSING
+// ================================================================
+
+// BUG 1 FIX: Strict parse with proper error detection
+static bool parseFloatStrict(const String& valStr, float& out)
+{
+    if (valStr.length() == 0) return false;
+
+    const char* start = valStr.c_str();
+    char* end = nullptr;
+    float v = strtof(start, &end);
+
+    // BUG 1 FIX: Check if parsing actually consumed any characters
+    if (end == start) return false;
+
+    // BUG 1 FIX: Skip trailing spaces and check for garbage
+    while (*end == ' ' || *end == '\t') ++end;
+    if (*end != '\0') return false;
+
+    out = v;
+    return true;
+}
+
+// BUG 5 FIX: Full range validation
+static bool validateTuneValue(const String& key, float value)
+{
+    if (key.endsWith("_PA")) {
+        if (value < TUNE_P_ANGLE_MIN || value > TUNE_P_ANGLE_MAX) return false;
+        return true;
+    }
+    if (key.endsWith("_PR")) {
+        if (value < TUNE_P_RATE_MIN || value > TUNE_P_RATE_MAX) return false;
+        return true;
+    }
+    if (key.endsWith("_IR")) {
+        if (value < TUNE_I_RATE_MIN || value > TUNE_I_RATE_MAX) return false;
+        return true;
+    }
+    if (key.endsWith("_DR")) {
+        if (value < TUNE_D_RATE_MIN || value > TUNE_D_RATE_MAX) return false;
+        return true;
+    }
+    return true;
+}
+
+
+// ================================================================
+//  SECTION 5 — MAIN TUNING COMMAND PARSER
+// ================================================================
+
+// BUG 7 FIX: Pass String by const reference để tránh heap allocation
+static void parseTuneCommand(const String& cmd) {
+
+    String cmdCopy = cmd;  // Single controlled copy
+    cmdCopy.trim();
+    if (cmdCopy.length() == 0) return;
+
+    if (cmdCopy.equalsIgnoreCase("SHOW_PID")) {
+        Serial.println(F("\r\n======== CURRENT PID PARAMS ========"));
+
+        Serial.print(F("ROLL  | PA=")); Serial.print(pidRoll.P_angle, 4);
+        Serial.print(F("  PR=")); Serial.print(pidRoll.P_rate, 4);
+        Serial.print(F("  IR=")); Serial.print(pidRoll.I_rate, 4);
+        Serial.print(F("  DR=")); Serial.println(pidRoll.D_rate, 4);
+
+        Serial.print(F("PITCH | PA=")); Serial.print(pidPitch.P_angle, 4);
+        Serial.print(F("  PR=")); Serial.print(pidPitch.P_rate, 4);
+        Serial.print(F("  IR=")); Serial.print(pidPitch.I_rate, 4);
+        Serial.print(F("  DR=")); Serial.println(pidPitch.D_rate, 4);
+
+        Serial.print(F("YAW   |         PR=")); Serial.print(pidYaw.P_rate, 4);
+        Serial.print(F("  IR=")); Serial.print(pidYaw.I_rate, 4);
+        Serial.print(F("  DR=")); Serial.println(pidYaw.D_rate, 4);
+
+        Serial.println(F("====================================\r\n"));
+        return;
+    }
+
+    int spaceIdx = cmdCopy.indexOf(' ');
+    if (spaceIdx < 1) {
+        Serial.println(F("[TUNE] ERR: Sai cú pháp. VD: ROLL_PR 1.5 | SHOW_PID"));
+        return;
+    }
+
+    String key = cmdCopy.substring(0, spaceIdx);
+    key.toUpperCase();
+
+    String valStr = cmdCopy.substring(spaceIdx + 1);
+    valStr.trim();
+
+#ifdef PID_DEBUG_HOST
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "{\"key\":\"%s\",\"valStrLen\":%u,\"valStr\":\"%s\"}",
+                 key.c_str(), valStr.length(), valStr.c_str());
+        if constexpr (false) { }  // Placeholder for debugLog
+    }
+#endif
+
+    // BUG 4 FIX: Guard empty valStr after trim
+    if (valStr.length() == 0) {
+        Serial.println(F("[TUNE] ERR: Thiếu giá trị. VD: ROLL_PR 1.5"));
+        return;
+    }
+
+    // BUG 1 FIX: Strict float parsing with error detection
+    float value = 0.0f;
+    if (!parseFloatStrict(valStr, value)) {
+        Serial.print(F("[TUNE] ERR: Giá trị không hợp lệ → \""));
+        Serial.print(valStr);
+        Serial.println(F("\""));
+        return;
+    }
+
+    // BUG 5 FIX: Full range validation
+    if (!validateTuneValue(key, value)) {
+        Serial.print(F("[TUNE] ERR: Giá trị ngoài phạm vi cho "));
+        Serial.println(key);
+        return;
+    }
+
+    bool ok = true;
+
+    if      (key == "ROLL_PA")  { pidRoll.P_angle = value; }
+    else if (key == "ROLL_PR")  { pidRoll.P_rate  = value; }
+    else if (key == "ROLL_IR")  { pidRoll.I_rate  = value; pidRoll.resetIntegral(); }
+    else if (key == "ROLL_DR")  { pidRoll.D_rate  = value; pidRoll.resetDerivative(); }
+
+    else if (key == "PITCH_PA") { pidPitch.P_angle = value; }
+    else if (key == "PITCH_PR") { pidPitch.P_rate  = value; }
+    else if (key == "PITCH_IR") { pidPitch.I_rate  = value; pidPitch.resetIntegral(); }
+    else if (key == "PITCH_DR") { pidPitch.D_rate  = value; pidPitch.resetDerivative(); }
+
+    else if (key == "YAW_PR")   { pidYaw.P_rate   = value; }
+    else if (key == "YAW_IR")   { pidYaw.I_rate   = value; pidYaw.resetIntegral(); }
+    else if (key == "YAW_DR")   { pidYaw.D_rate   = value; pidYaw.resetDerivative(); }
+    else if (key == "YAW_PA") {
+        Serial.println(F("[TUNE] WARN: YAW không có Angle Loop → YAW_PA bị từ chối."));
+        ok = false;
+    }
+
+    else {
+        Serial.print(F("[TUNE] ERR: Lệnh không hợp lệ → "));
+        Serial.println(key);
+        ok = false;
+    }
+
+    if (ok) {
+        Serial.print(F("[TUNE] OK  "));
+        Serial.print(key);
+        Serial.print(F(" = "));
+        Serial.println(value, 4);
+    }
+}
 
 
 // ================================================================
 //  USAGE NOTES (cho file .ino chính)
 // ================================================================
 //
-//  #include "pid_core.h"           // header — có thể include từ nhiều TU
-//  // pid_core.cpp phải được compile/link cùng sketch
+//  #include "pid_core.h"           // header — chỉ include 1 lần
 //
 //  // Trong loop() @ 1 kHz (dt = 0.001f):
 //  float rollOut  = pidRoll.compute (rcRoll,  ahrsRoll,  gyroX, dt);
