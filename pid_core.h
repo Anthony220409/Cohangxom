@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <cmath>
 
 // ================================================================
 //  CONDITIONAL COMPILATION: Hardware vs Host (Debug) Mode
@@ -154,6 +155,7 @@ constexpr float YAW_RATE_D    = 0.00f;
 
 //  ── Giới hạn chung ────────────────────────────────────────────────
 constexpr float MAX_ANGLE_RATE   = 200.0f;   // °/s  — trần target_rate Angle Loop
+constexpr float MAX_YAW_RATE     = 360.0f;   // °/s  — trần setpoint_rate Rate-only (Yaw)
 constexpr float INTEGRAL_LIMIT   = 100.0f;   // Anti-windup clamp (±)
 constexpr float PID_OUTPUT_LIMIT = 250.0f;   // Output final clamp (±250 / 1023)
 
@@ -210,8 +212,8 @@ public:
     //  compute()  —  Full Cascaded: Angle Loop → Rate Loop
     //  Dùng cho ROLL và PITCH
     // ─────────────────────────────────────────────────────────
-    //  @param setpoint_angle  Góc mong muốn   [°]
-    //  @param measured_angle  Góc từ AHRS     [°]
+    //  @param setpoint_angle  Góc mong muốn   [°, wrapped ±180°]
+    //  @param measured_angle  Góc từ AHRS     [°, wrapped ±180°]
     //  @param measured_gyro   Vận tốc góc IMU [°/s]
     //  @param dt              Chu kỳ vòng lặp [s]  (0.001 @ 1 kHz)
     //  @return                PID output [-250 … +250]
@@ -220,7 +222,13 @@ public:
                   float measured_gyro,
                   float dt)
     {
+        // FIX BUG 9: Angle wrapping — tính error với wraparound ±180°
         float angle_error = setpoint_angle - measured_angle;
+        
+        // Normalize angle_error to [-180, +180]
+        while (angle_error > 180.0f)  angle_error -= 360.0f;
+        while (angle_error < -180.0f) angle_error += 360.0f;
+        
         float target_rate = P_angle * angle_error;
         target_rate = _clamp(target_rate, -MAX_ANGLE_RATE, MAX_ANGLE_RATE);
         return _rateLoop(target_rate, measured_gyro, dt);
@@ -238,6 +246,8 @@ public:
                           float measured_gyro,
                           float dt)
     {
+        // FIX BUG 8: Clamp setpoint_rate để consistent với compute()
+        setpoint_rate = _clamp(setpoint_rate, -MAX_YAW_RATE, MAX_YAW_RATE);
         return _rateLoop(setpoint_rate, measured_gyro, dt);
     }
 
@@ -342,12 +352,14 @@ static bool validateTuneValue(const String& key, float value)
 //  SECTION 5 — MAIN TUNING COMMAND PARSER
 // ================================================================
 
-inline void parseTuneCommand(String cmd) {
+// FIX BUG 7: Pass String by const reference để tránh heap allocation
+inline void parseTuneCommand(const String& cmd) {
 
-    cmd.trim();
-    if (cmd.length() == 0) return;
+    String cmdCopy = cmd;  // Single copy here, do the work locally
+    cmdCopy.trim();
+    if (cmdCopy.length() == 0) return;
 
-    if (cmd.equalsIgnoreCase("SHOW_PID")) {
+    if (cmdCopy.equalsIgnoreCase("SHOW_PID")) {
         Serial.println(F("\r\n======== CURRENT PID PARAMS ========"));
 
         Serial.print(F("ROLL  | PA=")); Serial.print(pidRoll.P_angle, 4);
@@ -368,16 +380,16 @@ inline void parseTuneCommand(String cmd) {
         return;
     }
 
-    int spaceIdx = cmd.indexOf(' ');
+    int spaceIdx = cmdCopy.indexOf(' ');
     if (spaceIdx < 1) {
         Serial.println(F("[TUNE] ERR: Sai cú pháp. VD: ROLL_PR 1.5 | SHOW_PID"));
         return;
     }
 
-    String key = cmd.substring(0, spaceIdx);
+    String key = cmdCopy.substring(0, spaceIdx);
     key.toUpperCase();
 
-    String valStr = cmd.substring(spaceIdx + 1);
+    String valStr = cmdCopy.substring(spaceIdx + 1);
     valStr.trim();
 
 #ifdef PID_DEBUG_HOST
